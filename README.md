@@ -30,12 +30,162 @@ REST API(`/release_task`・`/query_result`)経由で利用する常駐サーバ�
 
 ### `fast` / `fast-lowvram` で行っていること
 
-どちらも、楽譜プランとセマンティックトークンを生成するAR部分をtorch/BF16からvLLMへ切り替え、
-このリポジトリの4行のパッチでvLLMの重みFP8量子化と融合カーネルを有効にしています。
-BlackwellではAR部分が約36%高速化しました。NAR音響生成とVAEデコードにはFP8を適用していません。
+結論からいうと、両者は**同じAR高速化経路**を使い、AR終了後にvLLMを
+残すか捨てるかが主な違いです。`fast`は速度のためにARエンジンを残し、
+`fast-lowvram`はVRAMのためにARエンジンを捨てます。NARとVAEの計算内容、
+生成ステップ数、サンプリング設定を省略して速くしているわけではありません。
 
-- `fast`: vLLMワーカープロセスをNAR/VAE処理中も終了させず、次の曲までGPUに常駐させます。曲ごとのエンジン再起動を省くため最速ですが、vLLMとNAR/VAEのメモリが重なる分、約15GBのVRAMを使います。
-- `fast-lowvram`: 同じvLLM＋FP8を使いながら、AR生成後、NAR処理の前にvLLMを解放します。次の曲ではエンジンを再起動するため遅くなりますが、メモリの重なりを避けてピークを約9GBに抑えます。
+#### 実際に設定される値
+
+| 設定 | `fast` | `fast-lowvram` | 意味 |
+|---|---:|---:|---|
+| `YUE2_BACKEND` | `vllm` | `vllm` | ABCとセマンティックトークンのAR生成をvLLMで実行 |
+| `YUE2_VLLM_QUANT` | `fp8` | `fp8` | vLLMワーカー内のAR重みをFP8量子化 |
+| `YUE2_KEEP_VLLM` | `1` | `0` | NAR開始時にvLLMワーカーを終了させるかどうか |
+| `YUE2_OFFLOAD_AR` | `0` | `0` | NAR中のAR層CPU退避は行わない |
+| `YUE2_MEMORY_BUDGET_GIB` | `32` | `12` | GPU物理容量で上限を切る前のメモリ予算 |
+| VAEの既定タイル長 | 1024 frames | 512 frames | 12GiB以下の予算ではデコード時の一時メモリを削減 |
+
+表はプロファイルの既定値です。同名の個別環境変数を明示すれば、その項目だけを
+上書きできます。たとえば`YUE2_KEEP_VLLM=0`を指定した`fast`はエンジンを常駐させません。
+
+`YUE2_MEMORY_BUDGET_GIB=32`は32GiBを必ず確保する指定ではありません。
+物理VRAM容量を上限として扱う「使用可能予算」で、24GB GPUなら実容量側で制限されます。
+反対に`fast-lowvram`の12GiB設定は、親プロセスのPyTorchアロケータ、vLLMの
+GPU使用率、およびVAEのタイル長を低メモリ向けに制限します。数値はハード上限の
+目安であり、CUDAコンテキストや別プロセスを含む`nvidia-smi`の表示値と完全には一致しません。
+
+#### 1曲を生成する処理の流れ
+
+YuE2の生成は、大きく次の4段階です。
+
+1. **ABCプラン生成（AR）**: スタイルと歌詞から、メロディーやコードを表すABC記譜を生成します。
+2. **セマンティックトークン生成（AR）**: 条件文とABCから、音楽の粗い時系列表現であるcodec token列を生成します。
+3. **NAR音響生成**: セマンティックトークンから64次元の音響latentを生成します。32ステップのmidpoint法によるflow matchingです。
+4. **VAEデコード**: latentを48kHzの波形へ変換し、FLACとして保存します。
+
+`fast`系がvLLM＋FP8へ置き換えるのは、1と2の**AR部分だけ**です。3のNARは
+YuE2本体をBF16で、4のVAEはFP32で実行します。したがって「モデル全体をFP8化」
+しているわけではなく、FP8による速度差と数値差が直接入る範囲はAR生成です。
+
+処理は内部で次のように進みます。
+
+1. APIサーバ起動時に`YuE2Pipeline`を作成し、モデルの所在とハッシュを確認します。
+   この時点ではvLLMエンジン自体はまだ起動しません。
+2. 最初のAR生成時に、親のAPIプロセスとは別に
+   `python -m yue2.fast --worker`を起動します。プロセスを分けることで、
+   ワーカー終了時にvLLMのCUDAコンテキストとキャッシュをまとめて確実に解放できます。
+3. 元のYuE2 MoTチェックポイントから、ARに必要な埋め込み、Qwen3層、正規化層、
+   LM headだけを抽出し、vLLMが読めるQwen3形式の派生チェックポイントを作ります。
+   派生物は入力モデルのidentityをキーに`$YUE2_CACHE/yue2-ar`、または
+   `$HF_HOME/yue2-ar`以下へ保存されます。ロック、manifest、SHA-256検証があるため、
+   2回目以降は同じ派生物を安全に再利用します。
+4. ワーカー起動前に、親プロセスにロード済みのYuE2本体やVAEがあればCPUへ移し、
+   `torch.cuda.empty_cache()`を実行して、vLLMを載せる空きを作ります。
+5. vLLM 0.19.0の`AsyncLLM`を、BF16演算dtype、最大コンテキスト24,576、
+   同時系列数1、chunked prefill、prefix cache有効で構築します。KV cacheは
+   BF16相当の必要量を系列数1として明示計算します。
+6. 本リポジトリのFP8パッチが`quantization="fp8"`をvLLMへ渡します。
+   これによりAR重みのFP8量子化と対応する融合カーネルが選ばれます。
+   パッチはこのオプションを環境変数から渡すだけで、プロンプト、乱数seed、
+   temperature、top-p、top-k、生成可能token集合などは変更しません。
+7. ABC生成とセマンティック生成は同じワーカーを続けて使用します。フェーズごとに
+   許可するtoken範囲と終了tokenを制限し、YuE2固有の直近window反復ペナルティは
+   カスタムTriton logits processorで再現します。API親プロセスとの通信は
+   stdin/stdout上のJSON Linesで行い、tokenと計測値を受け取ります。
+8. セマンティック生成が終わるとNARへ進み、ここでプロファイルごとの違いが現れます。
+
+#### `fast`: vLLMを曲間でも常駐させる
+
+アップストリームの`YuE2Pipeline.synthesize()`は、NAR開始直前に`close_vllm()`を
+呼びます。`fast`ではAPIサーバ側がこの呼び出しだけを無操作化し、実際の終了関数は
+サーバ停止時用に保存します。その結果、次の状態になります。
+
+```text
+1曲目: vLLM起動 → ABC → semantic → [vLLMを残したまま] NAR → VAE
+2曲目:             ABC → semantic → [vLLMを残したまま] NAR → VAE
+                              ↑ エンジンの再ロードなし
+```
+
+- vLLMワーカーはNAR/VAE中も生存し、AR重みとKV cache用領域を保持します。
+- NAR時には親プロセスのBF16 YuE2本体もGPUへ載るため、別プロセスのvLLMと
+  メモリ使用期間が重なります。これが約15GBのピークになる主因です。
+- VAEデコード前には親プロセス内のYuE2本体をCPUへ戻しますが、vLLMワーカーは残ります。
+- 2曲目以降はvLLMのプロセス生成、派生チェックポイント読込、FP8重み準備、
+  エンジンとカーネルの初期化などの固定費を再度払わず、すぐAR生成へ入れます。
+- APIサーバ終了時は保存しておいた本来の終了関数を呼び、ワーカープロセスを停止します。
+  プロセスグループへSIGTERMを送り、10秒で止まらなければSIGKILLまで行って孤児化を防ぎます。
+
+つまり`fast`の速さは、ARをvLLM＋FP8で速くする効果に加え、**常駐サーバで
+1曲ごとのエンジン再起動を消す効果**によるものです。性能値を比較するときは、
+初回のコールド生成と、エンジンロード済みのウォーム生成を分けて考える必要があります。
+
+#### `fast-lowvram`: ARとNAR/VAEを同時に載せない
+
+`fast-lowvram`はアップストリーム本来の`close_vllm()`をそのまま使います。
+セマンティック生成を終えて`synthesize()`へ入った直後、NARモデルをGPUへ載せる前に
+vLLMワーカープロセスを終了します。
+
+```text
+1曲目: vLLM起動 → ABC → semantic → vLLM終了 → NAR → VAE
+2曲目: vLLM再起動 → ABC → semantic → vLLM終了 → NAR → VAE
+                                      ↑ VRAM使用期間を分離
+```
+
+- AR中はvLLMワーカーを使用し、NAR/VAE用モデルはCPU側に置きます。
+- AR終了後はワーカーをプロセスごと終了するため、vLLMの重み、KV cache、
+  CUDAコンテキストが解放されてからBF16のYuE2本体をGPUへ載せます。
+- VAE時にはYuE2本体を再びCPUへ移し、VAEだけをGPUへ載せます。
+- さらに12GiB予算ではVAEを1024 framesではなく512 frames単位でタイルデコードし、
+  長い曲のデコード一時メモリを減らします。halo 16 framesを付けて境界を処理するため、
+  単純に音声を不連続なブロックへ分割しているわけではありません。
+- 次の曲ではvLLMを再び起動する必要があり、実測環境では曲ごとに約20秒の固定費が
+  加わります。派生ARチェックポイントはキャッシュ済みでも、重みのロードと
+  GPU上のエンジン構築は毎回必要です。
+
+このように、約9GBというピークはモデルを小さくした結果ではなく、主に
+**AR、NAR、VAEのGPU滞在時間を重ねない**ことで実現しています。生成アルゴリズムを
+省略していないため、代償は曲ごとの再起動時間です。
+
+#### FP8の範囲、品質、再現性
+
+- FP8になるのはvLLMワーカー内のAR重みです。KV cache、NAR、VAEまでFP8になるわけではありません。
+- FP8パッチによる変更は[`patches/fast-fp8.diff`](patches/fast-fp8.diff)の実質4行です。
+  `YUE2_VLLM_QUANT`を読み、値をvLLMの`AsyncEngineArgs.quantization`へ渡します。
+- Blackwellで、FP8なしのvLLM ARと比較してAR部分が約36%高速化しました。
+  これは曲全体が36%高速になるという意味ではありません。NARとVAEの時間は残ります。
+- FP8はBF16と丸め方が異なるため、同じseedでもBF16経路とtoken選択が分岐し、
+  最終的な曲が変わる可能性があります。聴感品質は同等であることを確認していますが、
+  BF16の同一出力再現やアップストリームとの厳密比較には`original`を使用してください。
+- `fast`と`fast-lowvram`同士はAR設定が同じです。ただし、実行環境、ライブラリ、
+  GPU、並列実行状況まで含むbit単位の同一性を保証するものではありません。
+
+#### vLLMを使わずtorchへフォールバックする場合
+
+`YUE2_PROFILE=fast`系を選んでも、すべての入力が必ずvLLMを通るわけではありません。
+次の場合は互換性を優先してAR生成をtorchへフォールバックします。
+
+- `cfg_scale != 1.0`で、positive/negativeの2枝を使うCFGが必要な場合
+- `cot=off`の歴史的サンプリング経路を使う場合（既定guidanceも1.01）
+- CUDA以外のdeviceを指定した場合
+- パイプライン本体の実験的`quantization`を別途有効にした場合
+
+通常の`cot=full`または`cot=melody`、`cfg_scale`未指定、CUDA実行ではvLLM経路になります。
+実際にどちらを通ったかは生成物の`result.json`にある
+`timing.abc.backend_actual`と`timing.semantic.backend_actual`で確認できます。
+同じ箇所の`engine_load_seconds`が0なら既存エンジンを再利用しており、0より大きければ
+そのフェーズで新しくロードしたことを示します。`output_tps`、`ttft_seconds`、
+`kv_cache_memory_bytes`もAR側の詳細確認に利用できます。
+
+#### 選び方
+
+- **24GB級以上で、APIサーバから連続して曲を作る**: `fast`。ウォーム状態の速度を優先します。
+- **12GB級、または他のGPU処理へVRAMを空けたい**: `fast-lowvram`。1曲ごとの待ち時間と引換えにピークを抑えます。
+- **アップストリームBF16経路との比較、FP8を含まない再現性が必要**: `original`。
+
+なお、`/plan`はABC生成だけでNARへ進まないため、`fast-lowvram`でもその呼び出し直後には
+「NAR直前の解放点」へ到達しません。通常の`/release_task`、`/edit_task`、
+`/regenerate_task`ではsemantic生成後にNARへ進むため、上記のライフサイクルになります。
 
 ### RTX PRO 4000 Blackwell実測
 
