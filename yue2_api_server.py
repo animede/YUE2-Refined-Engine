@@ -354,6 +354,10 @@ def _run_plan(job: Job) -> Dict[str, Any]:
     out_dir = OUTPUT_ROOT / job.job_id
     plan = pipe.plan(**job.request)
     plan.save(out_dir)
+    # /edit_task がプランの元リクエストを引き継げるよう、
+    # 通常生成の save_artifacts() と同じ形式で保存する。
+    from yue2.storage import write_json
+    write_json(out_dir / "request.json", plan.request.to_dict())
     return {
         "abc_score": plan.abc,
         "truncated": plan.truncated,

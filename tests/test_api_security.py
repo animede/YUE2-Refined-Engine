@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 _OUTPUT_DIR = tempfile.TemporaryDirectory()
@@ -71,6 +72,32 @@ class ApiSecurityTests(unittest.TestCase):
         url = server._audio_url(path)
         self.assertEqual(url, "/v1/audio?path=job-id/audio.flac")
         self.assertNotIn(str(server.OUTPUT_ROOT), url)
+
+    def test_plan_persists_request_for_edit_workflow(self):
+        class FakeRequest:
+            def to_dict(self):
+                return {"style": "pop", "lyrics": "[Verse]\nhello", "cot": "full"}
+
+        class FakePlan:
+            request = FakeRequest()
+            abc = "X:1\nV: Vocal\nK:C\nC4|"
+            truncated = False
+
+            def save(self, directory):
+                Path(directory).mkdir(parents=True, exist_ok=True)
+
+        class FakePipeline:
+            def plan(self, **request):
+                self.request = request
+                return FakePlan()
+
+        job = server.Job("plan", {"style": "pop", "lyrics": "[Verse]\nhello", "cot": "full"})
+        with patch.object(server.PIPELINE, "get", return_value=FakePipeline()):
+            server._run_plan(job)
+
+        request_path = server.OUTPUT_ROOT / job.job_id / "request.json"
+        self.assertTrue(request_path.is_file())
+        self.assertIn('"style": "pop"', request_path.read_text())
 
 
 if __name__ == "__main__":
