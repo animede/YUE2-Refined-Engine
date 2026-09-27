@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  api-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Check Python syntax
+        run: python -m py_compile yue2_api_server.py vendor/yue2-fp8/fast.py tests/test_api_security.py
+      - name: Run API security tests
+        env:
+          YUE2_INIT_AT_STARTUP: "0"
+        run: python -m unittest discover -s tests -v

@@ -1,0 +1,13 @@
+--- a/yue2/fast.py
++++ b/yue2/fast.py
+@@ -366,7 +366,10 @@
+     if kv_bytes + weights_bytes + 3 * 2**30 > budget:
+         raise MemoryError("Requested vLLM memory budget cannot fit full-context BF16 AR+KV+3GiB reserve")
+     load_start = time.perf_counter()
++    # 実験用: YUE2_VLLM_QUANT=fp8 でエンジン側の重みFP8量子化(融合カーネル)を有効化
++    quant = os.environ.get("YUE2_VLLM_QUANT") or None
+     args = AsyncEngineArgs(model=str(derived), skip_tokenizer_init=True, dtype="bfloat16",
++                           quantization=quant,
+                            max_model_len=CONTEXT, max_num_seqs=1, max_num_batched_tokens=2048,
+                            enable_chunked_prefill=True, enable_prefix_caching=True,
+                            kv_cache_memory_bytes=kv_bytes,

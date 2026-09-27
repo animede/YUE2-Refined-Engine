@@ -1,0 +1,15 @@
+# YuE2本体のクローン (README手順で取得)
+YuE/
+
+# 生成物・ログ・キャッシュ
+outputs/
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# ローカル設定
+.claude/
+.env

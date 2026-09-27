@@ -1,0 +1,13 @@
+YuE2 API Server
+Copyright 2026 the repository contributors
+
+vendor/yue2-fp8/fast.py is a modified copy of yue2/fast.py from yue2-infer
+0.1.6 (https://github.com/multimodal-art-projection/YuE, Apache-2.0).
+The modification notice is included at the top of that file and the exact
+change is recorded in patches/fast-fp8.diff.
+
+The server optionally loads abc_tools.py from the user's local YuE2 clone
+(skills/yue2-music/scripts, Apache-2.0) for ABC score validation.
+
+YuE2 model weights are not part of this repository. Their upstream license
+(CC BY-NC 4.0 with additional terms) applies when users download or use them.
