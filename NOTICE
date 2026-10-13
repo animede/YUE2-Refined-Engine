@@ -1,5 +1,5 @@
 YuE2 API Server
-Copyright 2026 the repository contributors
+Copyright 2026 YUZUKI (animede)
 
 vendor/yue2-fp8/fast.py is a modified copy of yue2/fast.py from yue2-infer
 0.1.6 (https://github.com/multimodal-art-projection/YuE, Apache-2.0).

@@ -281,6 +281,8 @@ diffパッチ([patches/fast-fp8.diff](patches/fast-fp8.diff))と改変済みフ�
 
 ## ライセンス
 
+本リポジトリのソースコードの著作権者: © 2026 YUZUKI (animede)。著作権表示と [NOTICE](NOTICE) の内容は、Apache-2.0 第4条に基づき再配布時も保持してください。
+
 - 本リポジトリのコード: [Apache License 2.0](LICENSE)
 - `vendor/yue2-fp8/fast.py` は YuE2 (Apache-2.0) の改変版(改変表示はファイル冒頭)
 - YuE2のモデル重みは本リポジトリに含まれません(CC BY-NC 4.0+クリエイター許諾条項。
